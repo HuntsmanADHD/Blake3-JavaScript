@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>BLAKE3 ULTRA v2 - Maximum Performance</title>
+  <style>
+    body {background:#000;color:#0f0;font-family:monospace;font-size:18px;padding:40px;}
+    h1 {color:#0ff;font-size:28px;}
+    h2 {color:#ff0;margin-top:30px;}
+    button {font-size:20px;padding:12px 24px;margin:8px;cursor:pointer;background:#030;color:#0f0;border:2px solid #0f0;}
+    button:hover {background:#050;}
+    pre {margin-top:20px;font-size:16px;background:#111;padding:20px;border:2px solid #0f0;white-space:pre-wrap;max-height:500px;overflow-y:auto;}
+    .pass {color:#0f0;} .fail {color:#f00;} .speed {color:#ff0;font-size:22px;font-weight:bold;}
+    .info {color:#888;font-size:14px;}
+  </style>
+</head>
+<body>
+  <h1>BLAKE3 ULTRA v2 - Maximum Performance</h1>
+  <p class="info">Fully unrolled 7 rounds | DataView acceleration | Extended JIT warmup | Best-of-5 benchmark</p>
+
+  <h2>Tests</h2>
+  <button onclick="runTests()">Run Tests</button>
+
+  <h2>Benchmarks</h2>
+  <button onclick="benchmark(10)">10 MiB</button>
+  <button onclick="benchmark(100)">100 MiB</button>
+  <button onclick="benchmark(500)">500 MiB</button>
+  <button onclick="benchmark(1000)">1 GiB</button>
+
+  <pre id="log">Click a button to start...</pre>
+
+<script>
+'use strict';
+
+const BLOCK_LEN = 64;
+const CHUNK_LEN = 1024;
+const CHUNK_START = 1;
+const CHUNK_END = 2;
+const PARENT = 4;
+const ROOT = 8;
+
+const IS_LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+
+// BLAKE3 IV (same as SHA-256)
+const IV_ARRAY = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+
+// Pre-allocated buffers (Haiku optimization #4 - pooled output buffer)
+let cvStack = null;
+const blockWords = new Uint32Array(16);
+const outWords = new Uint32Array(16);
+const outputBuffer = new Uint8Array(32); // Pooled output to reduce GC pressure
+
+function ensureCvStack(maxDepth) {
+  const depth = Math.max(maxDepth | 0, 10) | 0;
+  const length = (depth * 8) | 0;
+  if (cvStack === null || cvStack.length < length) {
+    cvStack = new Uint32Array(length);
+  }
+  return cvStack;
+}
+
+// FULLY UNROLLED readWordsLE - eliminates loop overhead (Haiku optimization #1)
+function readWordsLE(bytes, offset, words, count) {
+  words[0]  = (bytes[offset]    | (bytes[offset+1]  << 8) | (bytes[offset+2]  << 16) | (bytes[offset+3]  << 24)) | 0;
+  words[1]  = (bytes[offset+4]  | (bytes[offset+5]  << 8) | (bytes[offset+6]  << 16) | (bytes[offset+7]  << 24)) | 0;
+  words[2]  = (bytes[offset+8]  | (bytes[offset+9]  << 8) | (bytes[offset+10] << 16) | (bytes[offset+11] << 24)) | 0;
+  words[3]  = (bytes[offset+12] | (bytes[offset+13] << 8) | (bytes[offset+14] << 16) | (bytes[offset+15] << 24)) | 0;
+  words[4]  = (bytes[offset+16] | (bytes[offset+17] << 8) | (bytes[offset+18] << 16) | (bytes[offset+19] << 24)) | 0;
+  words[5]  = (bytes[offset+20] | (bytes[offset+21] << 8) | (bytes[offset+22] << 16) | (bytes[offset+23] << 24)) | 0;
+  words[6]  = (bytes[offset+24] | (bytes[offset+25] << 8) | (bytes[offset+26] << 16) | (bytes[offset+27] << 24)) | 0;
+  words[7]  = (bytes[offset+28] | (bytes[offset+29] << 8) | (bytes[offset+30] << 16) | (bytes[offset+31] << 24)) | 0;
+  words[8]  = (bytes[offset+32] | (bytes[offset+33] << 8) | (bytes[offset+34] << 16) | (bytes[offset+35] << 24)) | 0;
+  words[9]  = (bytes[offset+36] | (bytes[offset+37] << 8) | (bytes[offset+38] << 16) | (bytes[offset+39] << 24)) | 0;
+  words[10] = (bytes[offset+40] | (bytes[offset+41] << 8) | (bytes[offset+42] << 16) | (bytes[offset+43] << 24)) | 0;
+  words[11] = (bytes[offset+44] | (bytes[offset+45] << 8) | (bytes[offset+46] << 16) | (bytes[offset+47] << 24)) | 0;
+  words[12] = (bytes[offset+48] | (bytes[offset+49] << 8) | (bytes[offset+50] << 16) | (bytes[offset+51] << 24)) | 0;
+  words[13] = (bytes[offset+52] | (bytes[offset+53] << 8) | (bytes[offset+54] << 16) | (bytes[offset+55] << 24)) | 0;
+  words[14] = (bytes[offset+56] | (bytes[offset+57] << 8) | (bytes[offset+58] << 16) | (bytes[offset+59] << 24)) | 0;
+  words[15] = (bytes[offset+60] | (bytes[offset+61] << 8) | (bytes[offset+62] << 16) | (bytes[offset+63] << 24)) | 0;
+}
+
+// Optimized readPartialBlock - only zero what's needed (Haiku optimization #3)
+function readPartialBlock(bytes, offset, length, words) {
+  const fullWords = length >> 2;
+  // Only zero from fullWords+1 onward
+  for (let i = fullWords; i < 16; i = i + 1 | 0) words[i] = 0;
+  // Read full words
+  let i = 0;
+  for (; i + 3 < length; i = i + 4 | 0) {
+    const idx = i >> 2;
+    words[idx] = (bytes[offset + i] |
+                  (bytes[offset + i + 1 | 0] << 8) |
+                  (bytes[offset + i + 2 | 0] << 16) |
+                  (bytes[offset + i + 3 | 0] << 24)) | 0;
+  }
+  // Handle tail bytes
+  if (i < length) {
+    const idx = i >> 2;
+    let word = 0;
+    for (let shift = 0; i < length; i = i + 1 | 0, shift = shift + 8 | 0) {
+      word |= bytes[offset + i | 0] << shift;
+    }
+    words[idx] = word | 0;
+  }
+}
+
+// FULLY UNROLLED COMPRESS - All 7 rounds with precomputed message schedule
+function compressTruncated(cv, cvOff, msg, msgOff, out, outOff, counter, blockLen, flags) {
+  let s0 = cv[cvOff] | 0;
+  let s1 = cv[cvOff + 1 | 0] | 0;
+  let s2 = cv[cvOff + 2 | 0] | 0;
+  let s3 = cv[cvOff + 3 | 0] | 0;
+  let s4 = cv[cvOff + 4 | 0] | 0;
+  let s5 = cv[cvOff + 5 | 0] | 0;
+  let s6 = cv[cvOff + 6 | 0] | 0;
+  let s7 = cv[cvOff + 7 | 0] | 0;
+  let s8 = 0x6a09e667 | 0;
+  let s9 = 0xbb67ae85 | 0;
+  let s10 = 0x3c6ef372 | 0;
+  let s11 = 0xa54ff53a | 0;
+  let s12 = counter | 0;
+  let s13 = 0;
+  let s14 = blockLen | 0;
+  let s15 = flags | 0;
+
+  const m0 = msg[msgOff] | 0;
+  const m1 = msg[msgOff + 1 | 0] | 0;
+  const m2 = msg[msgOff + 2 | 0] | 0;
+  const m3 = msg[msgOff + 3 | 0] | 0;
+  const m4 = msg[msgOff + 4 | 0] | 0;
+  const m5 = msg[msgOff + 5 | 0] | 0;
+  const m6 = msg[msgOff + 6 | 0] | 0;
+  const m7 = msg[msgOff + 7 | 0] | 0;
+  const m8 = msg[msgOff + 8 | 0] | 0;
+  const m9 = msg[msgOff + 9 | 0] | 0;
+  const m10 = msg[msgOff + 10 | 0] | 0;
+  const m11 = msg[msgOff + 11 | 0] | 0;
+  const m12 = msg[msgOff + 12 | 0] | 0;
+  const m13 = msg[msgOff + 13 | 0] | 0;
+  const m14 = msg[msgOff + 14 | 0] | 0;
+  const m15 = msg[msgOff + 15 | 0] | 0;
+
+  // ROUND 0
+  s0 = (s0 + s4 | 0) + m0 | 0; s12 ^= s0; s12 = (s12 >>> 16) | (s12 << 16);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 12) | (s4 << 20);
+  s0 = (s0 + s4 | 0) + m1 | 0; s12 ^= s0; s12 = (s12 >>> 8) | (s12 << 24);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 7) | (s4 << 25);
+  s1 = (s1 + s5 | 0) + m2 | 0; s13 ^= s1; s13 = (s13 >>> 16) | (s13 << 16);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 12) | (s5 << 20);
+  s1 = (s1 + s5 | 0) + m3 | 0; s13 ^= s1; s13 = (s13 >>> 8) | (s13 << 24);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 7) | (s5 << 25);
+  s2 = (s2 + s6 | 0) + m4 | 0; s14 ^= s2; s14 = (s14 >>> 16) | (s14 << 16);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 12) | (s6 << 20);
+  s2 = (s2 + s6 | 0) + m5 | 0; s14 ^= s2; s14 = (s14 >>> 8) | (s14 << 24);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 7) | (s6 << 25);
+  s3 = (s3 + s7 | 0) + m6 | 0; s15 ^= s3; s15 = (s15 >>> 16) | (s15 << 16);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 12) | (s7 << 20);
+  s3 = (s3 + s7 | 0) + m7 | 0; s15 ^= s3; s15 = (s15 >>> 8) | (s15 << 24);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 7) | (s7 << 25);
+  s0 = (s0 + s5 | 0) + m8 | 0; s15 ^= s0; s15 = (s15 >>> 16) | (s15 << 16);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 12) | (s5 << 20);
+  s0 = (s0 + s5 | 0) + m9 | 0; s15 ^= s0; s15 = (s15 >>> 8) | (s15 << 24);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 7) | (s5 << 25);
+  s1 = (s1 + s6 | 0) + m10 | 0; s12 ^= s1; s12 = (s12 >>> 16) | (s12 << 16);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 12) | (s6 << 20);
+  s1 = (s1 + s6 | 0) + m11 | 0; s12 ^= s1; s12 = (s12 >>> 8) | (s12 << 24);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 7) | (s6 << 25);
+  s2 = (s2 + s7 | 0) + m12 | 0; s13 ^= s2; s13 = (s13 >>> 16) | (s13 << 16);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 12) | (s7 << 20);
+  s2 = (s2 + s7 | 0) + m13 | 0; s13 ^= s2; s13 = (s13 >>> 8) | (s13 << 24);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 7) | (s7 << 25);
+  s3 = (s3 + s4 | 0) + m14 | 0; s14 ^= s3; s14 = (s14 >>> 16) | (s14 << 16);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 12) | (s4 << 20);
+  s3 = (s3 + s4 | 0) + m15 | 0; s14 ^= s3; s14 = (s14 >>> 8) | (s14 << 24);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 7) | (s4 << 25);
+
+  // ROUND 1 [2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8]
+  s0 = (s0 + s4 | 0) + m2 | 0; s12 ^= s0; s12 = (s12 >>> 16) | (s12 << 16);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 12) | (s4 << 20);
+  s0 = (s0 + s4 | 0) + m6 | 0; s12 ^= s0; s12 = (s12 >>> 8) | (s12 << 24);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 7) | (s4 << 25);
+  s1 = (s1 + s5 | 0) + m3 | 0; s13 ^= s1; s13 = (s13 >>> 16) | (s13 << 16);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 12) | (s5 << 20);
+  s1 = (s1 + s5 | 0) + m10 | 0; s13 ^= s1; s13 = (s13 >>> 8) | (s13 << 24);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 7) | (s5 << 25);
+  s2 = (s2 + s6 | 0) + m7 | 0; s14 ^= s2; s14 = (s14 >>> 16) | (s14 << 16);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 12) | (s6 << 20);
+  s2 = (s2 + s6 | 0) + m0 | 0; s14 ^= s2; s14 = (s14 >>> 8) | (s14 << 24);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 7) | (s6 << 25);
+  s3 = (s3 + s7 | 0) + m4 | 0; s15 ^= s3; s15 = (s15 >>> 16) | (s15 << 16);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 12) | (s7 << 20);
+  s3 = (s3 + s7 | 0) + m13 | 0; s15 ^= s3; s15 = (s15 >>> 8) | (s15 << 24);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 7) | (s7 << 25);
+  s0 = (s0 + s5 | 0) + m1 | 0; s15 ^= s0; s15 = (s15 >>> 16) | (s15 << 16);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 12) | (s5 << 20);
+  s0 = (s0 + s5 | 0) + m11 | 0; s15 ^= s0; s15 = (s15 >>> 8) | (s15 << 24);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 7) | (s5 << 25);
+  s1 = (s1 + s6 | 0) + m12 | 0; s12 ^= s1; s12 = (s12 >>> 16) | (s12 << 16);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 12) | (s6 << 20);
+  s1 = (s1 + s6 | 0) + m5 | 0; s12 ^= s1; s12 = (s12 >>> 8) | (s12 << 24);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 7) | (s6 << 25);
+  s2 = (s2 + s7 | 0) + m9 | 0; s13 ^= s2; s13 = (s13 >>> 16) | (s13 << 16);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 12) | (s7 << 20);
+  s2 = (s2 + s7 | 0) + m14 | 0; s13 ^= s2; s13 = (s13 >>> 8) | (s13 << 24);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 7) | (s7 << 25);
+  s3 = (s3 + s4 | 0) + m15 | 0; s14 ^= s3; s14 = (s14 >>> 16) | (s14 << 16);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 12) | (s4 << 20);
+  s3 = (s3 + s4 | 0) + m8 | 0; s14 ^= s3; s14 = (s14 >>> 8) | (s14 << 24);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 7) | (s4 << 25);
+
+  // ROUND 2 [3,4,10,12,13,2,7,14,6,5,9,0,11,15,8,1]
+  s0 = (s0 + s4 | 0) + m3 | 0; s12 ^= s0; s12 = (s12 >>> 16) | (s12 << 16);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 12) | (s4 << 20);
+  s0 = (s0 + s4 | 0) + m4 | 0; s12 ^= s0; s12 = (s12 >>> 8) | (s12 << 24);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 7) | (s4 << 25);
+  s1 = (s1 + s5 | 0) + m10 | 0; s13 ^= s1; s13 = (s13 >>> 16) | (s13 << 16);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 12) | (s5 << 20);
+  s1 = (s1 + s5 | 0) + m12 | 0; s13 ^= s1; s13 = (s13 >>> 8) | (s13 << 24);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 7) | (s5 << 25);
+  s2 = (s2 + s6 | 0) + m13 | 0; s14 ^= s2; s14 = (s14 >>> 16) | (s14 << 16);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 12) | (s6 << 20);
+  s2 = (s2 + s6 | 0) + m2 | 0; s14 ^= s2; s14 = (s14 >>> 8) | (s14 << 24);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 7) | (s6 << 25);
+  s3 = (s3 + s7 | 0) + m7 | 0; s15 ^= s3; s15 = (s15 >>> 16) | (s15 << 16);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 12) | (s7 << 20);
+  s3 = (s3 + s7 | 0) + m14 | 0; s15 ^= s3; s15 = (s15 >>> 8) | (s15 << 24);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 7) | (s7 << 25);
+  s0 = (s0 + s5 | 0) + m6 | 0; s15 ^= s0; s15 = (s15 >>> 16) | (s15 << 16);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 12) | (s5 << 20);
+  s0 = (s0 + s5 | 0) + m5 | 0; s15 ^= s0; s15 = (s15 >>> 8) | (s15 << 24);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 7) | (s5 << 25);
+  s1 = (s1 + s6 | 0) + m9 | 0; s12 ^= s1; s12 = (s12 >>> 16) | (s12 << 16);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 12) | (s6 << 20);
+  s1 = (s1 + s6 | 0) + m0 | 0; s12 ^= s1; s12 = (s12 >>> 8) | (s12 << 24);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 7) | (s6 << 25);
+  s2 = (s2 + s7 | 0) + m11 | 0; s13 ^= s2; s13 = (s13 >>> 16) | (s13 << 16);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 12) | (s7 << 20);
+  s2 = (s2 + s7 | 0) + m15 | 0; s13 ^= s2; s13 = (s13 >>> 8) | (s13 << 24);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 7) | (s7 << 25);
+  s3 = (s3 + s4 | 0) + m8 | 0; s14 ^= s3; s14 = (s14 >>> 16) | (s14 << 16);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 12) | (s4 << 20);
+  s3 = (s3 + s4 | 0) + m1 | 0; s14 ^= s3; s14 = (s14 >>> 8) | (s14 << 24);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 7) | (s4 << 25);
+
+  // ROUND 3 [10,7,12,9,14,3,13,15,4,0,11,2,5,8,1,6]
+  s0 = (s0 + s4 | 0) + m10 | 0; s12 ^= s0; s12 = (s12 >>> 16) | (s12 << 16);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 12) | (s4 << 20);
+  s0 = (s0 + s4 | 0) + m7 | 0; s12 ^= s0; s12 = (s12 >>> 8) | (s12 << 24);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 7) | (s4 << 25);
+  s1 = (s1 + s5 | 0) + m12 | 0; s13 ^= s1; s13 = (s13 >>> 16) | (s13 << 16);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 12) | (s5 << 20);
+  s1 = (s1 + s5 | 0) + m9 | 0; s13 ^= s1; s13 = (s13 >>> 8) | (s13 << 24);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 7) | (s5 << 25);
+  s2 = (s2 + s6 | 0) + m14 | 0; s14 ^= s2; s14 = (s14 >>> 16) | (s14 << 16);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 12) | (s6 << 20);
+  s2 = (s2 + s6 | 0) + m3 | 0; s14 ^= s2; s14 = (s14 >>> 8) | (s14 << 24);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 7) | (s6 << 25);
+  s3 = (s3 + s7 | 0) + m13 | 0; s15 ^= s3; s15 = (s15 >>> 16) | (s15 << 16);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 12) | (s7 << 20);
+  s3 = (s3 + s7 | 0) + m15 | 0; s15 ^= s3; s15 = (s15 >>> 8) | (s15 << 24);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 7) | (s7 << 25);
+  s0 = (s0 + s5 | 0) + m4 | 0; s15 ^= s0; s15 = (s15 >>> 16) | (s15 << 16);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 12) | (s5 << 20);
+  s0 = (s0 + s5 | 0) + m0 | 0; s15 ^= s0; s15 = (s15 >>> 8) | (s15 << 24);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 7) | (s5 << 25);
+  s1 = (s1 + s6 | 0) + m11 | 0; s12 ^= s1; s12 = (s12 >>> 16) | (s12 << 16);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 12) | (s6 << 20);
+  s1 = (s1 + s6 | 0) + m2 | 0; s12 ^= s1; s12 = (s12 >>> 8) | (s12 << 24);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 7) | (s6 << 25);
+  s2 = (s2 + s7 | 0) + m5 | 0; s13 ^= s2; s13 = (s13 >>> 16) | (s13 << 16);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 12) | (s7 << 20);
+  s2 = (s2 + s7 | 0) + m8 | 0; s13 ^= s2; s13 = (s13 >>> 8) | (s13 << 24);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 7) | (s7 << 25);
+  s3 = (s3 + s4 | 0) + m1 | 0; s14 ^= s3; s14 = (s14 >>> 16) | (s14 << 16);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 12) | (s4 << 20);
+  s3 = (s3 + s4 | 0) + m6 | 0; s14 ^= s3; s14 = (s14 >>> 8) | (s14 << 24);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 7) | (s4 << 25);
+
+  // ROUND 4 [12,13,9,11,15,10,14,8,7,2,5,3,0,1,6,4]
+  s0 = (s0 + s4 | 0) + m12 | 0; s12 ^= s0; s12 = (s12 >>> 16) | (s12 << 16);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 12) | (s4 << 20);
+  s0 = (s0 + s4 | 0) + m13 | 0; s12 ^= s0; s12 = (s12 >>> 8) | (s12 << 24);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 7) | (s4 << 25);
+  s1 = (s1 + s5 | 0) + m9 | 0; s13 ^= s1; s13 = (s13 >>> 16) | (s13 << 16);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 12) | (s5 << 20);
+  s1 = (s1 + s5 | 0) + m11 | 0; s13 ^= s1; s13 = (s13 >>> 8) | (s13 << 24);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 7) | (s5 << 25);
+  s2 = (s2 + s6 | 0) + m15 | 0; s14 ^= s2; s14 = (s14 >>> 16) | (s14 << 16);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 12) | (s6 << 20);
+  s2 = (s2 + s6 | 0) + m10 | 0; s14 ^= s2; s14 = (s14 >>> 8) | (s14 << 24);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 7) | (s6 << 25);
+  s3 = (s3 + s7 | 0) + m14 | 0; s15 ^= s3; s15 = (s15 >>> 16) | (s15 << 16);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 12) | (s7 << 20);
+  s3 = (s3 + s7 | 0) + m8 | 0; s15 ^= s3; s15 = (s15 >>> 8) | (s15 << 24);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 7) | (s7 << 25);
+  s0 = (s0 + s5 | 0) + m7 | 0; s15 ^= s0; s15 = (s15 >>> 16) | (s15 << 16);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 12) | (s5 << 20);
+  s0 = (s0 + s5 | 0) + m2 | 0; s15 ^= s0; s15 = (s15 >>> 8) | (s15 << 24);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 7) | (s5 << 25);
+  s1 = (s1 + s6 | 0) + m5 | 0; s12 ^= s1; s12 = (s12 >>> 16) | (s12 << 16);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 12) | (s6 << 20);
+  s1 = (s1 + s6 | 0) + m3 | 0; s12 ^= s1; s12 = (s12 >>> 8) | (s12 << 24);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 7) | (s6 << 25);
+  s2 = (s2 + s7 | 0) + m0 | 0; s13 ^= s2; s13 = (s13 >>> 16) | (s13 << 16);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 12) | (s7 << 20);
+  s2 = (s2 + s7 | 0) + m1 | 0; s13 ^= s2; s13 = (s13 >>> 8) | (s13 << 24);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 7) | (s7 << 25);
+  s3 = (s3 + s4 | 0) + m6 | 0; s14 ^= s3; s14 = (s14 >>> 16) | (s14 << 16);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 12) | (s4 << 20);
+  s3 = (s3 + s4 | 0) + m4 | 0; s14 ^= s3; s14 = (s14 >>> 8) | (s14 << 24);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 7) | (s4 << 25);
+
+  // ROUND 5 [9,14,11,5,8,12,15,1,13,3,0,10,2,6,4,7]
+  s0 = (s0 + s4 | 0) + m9 | 0; s12 ^= s0; s12 = (s12 >>> 16) | (s12 << 16);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 12) | (s4 << 20);
+  s0 = (s0 + s4 | 0) + m14 | 0; s12 ^= s0; s12 = (s12 >>> 8) | (s12 << 24);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 7) | (s4 << 25);
+  s1 = (s1 + s5 | 0) + m11 | 0; s13 ^= s1; s13 = (s13 >>> 16) | (s13 << 16);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 12) | (s5 << 20);
+  s1 = (s1 + s5 | 0) + m5 | 0; s13 ^= s1; s13 = (s13 >>> 8) | (s13 << 24);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 7) | (s5 << 25);
+  s2 = (s2 + s6 | 0) + m8 | 0; s14 ^= s2; s14 = (s14 >>> 16) | (s14 << 16);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 12) | (s6 << 20);
+  s2 = (s2 + s6 | 0) + m12 | 0; s14 ^= s2; s14 = (s14 >>> 8) | (s14 << 24);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 7) | (s6 << 25);
+  s3 = (s3 + s7 | 0) + m15 | 0; s15 ^= s3; s15 = (s15 >>> 16) | (s15 << 16);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 12) | (s7 << 20);
+  s3 = (s3 + s7 | 0) + m1 | 0; s15 ^= s3; s15 = (s15 >>> 8) | (s15 << 24);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 7) | (s7 << 25);
+  s0 = (s0 + s5 | 0) + m13 | 0; s15 ^= s0; s15 = (s15 >>> 16) | (s15 << 16);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 12) | (s5 << 20);
+  s0 = (s0 + s5 | 0) + m3 | 0; s15 ^= s0; s15 = (s15 >>> 8) | (s15 << 24);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 7) | (s5 << 25);
+  s1 = (s1 + s6 | 0) + m0 | 0; s12 ^= s1; s12 = (s12 >>> 16) | (s12 << 16);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 12) | (s6 << 20);
+  s1 = (s1 + s6 | 0) + m10 | 0; s12 ^= s1; s12 = (s12 >>> 8) | (s12 << 24);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 7) | (s6 << 25);
+  s2 = (s2 + s7 | 0) + m2 | 0; s13 ^= s2; s13 = (s13 >>> 16) | (s13 << 16);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 12) | (s7 << 20);
+  s2 = (s2 + s7 | 0) + m6 | 0; s13 ^= s2; s13 = (s13 >>> 8) | (s13 << 24);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 7) | (s7 << 25);
+  s3 = (s3 + s4 | 0) + m4 | 0; s14 ^= s3; s14 = (s14 >>> 16) | (s14 << 16);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 12) | (s4 << 20);
+  s3 = (s3 + s4 | 0) + m7 | 0; s14 ^= s3; s14 = (s14 >>> 8) | (s14 << 24);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 7) | (s4 << 25);
+
+  // ROUND 6 [11,15,5,0,1,9,8,6,14,10,2,12,3,4,7,13]
+  s0 = (s0 + s4 | 0) + m11 | 0; s12 ^= s0; s12 = (s12 >>> 16) | (s12 << 16);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 12) | (s4 << 20);
+  s0 = (s0 + s4 | 0) + m15 | 0; s12 ^= s0; s12 = (s12 >>> 8) | (s12 << 24);
+  s8 = s8 + s12 | 0; s4 ^= s8; s4 = (s4 >>> 7) | (s4 << 25);
+  s1 = (s1 + s5 | 0) + m5 | 0; s13 ^= s1; s13 = (s13 >>> 16) | (s13 << 16);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 12) | (s5 << 20);
+  s1 = (s1 + s5 | 0) + m0 | 0; s13 ^= s1; s13 = (s13 >>> 8) | (s13 << 24);
+  s9 = s9 + s13 | 0; s5 ^= s9; s5 = (s5 >>> 7) | (s5 << 25);
+  s2 = (s2 + s6 | 0) + m1 | 0; s14 ^= s2; s14 = (s14 >>> 16) | (s14 << 16);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 12) | (s6 << 20);
+  s2 = (s2 + s6 | 0) + m9 | 0; s14 ^= s2; s14 = (s14 >>> 8) | (s14 << 24);
+  s10 = s10 + s14 | 0; s6 ^= s10; s6 = (s6 >>> 7) | (s6 << 25);
+  s3 = (s3 + s7 | 0) + m8 | 0; s15 ^= s3; s15 = (s15 >>> 16) | (s15 << 16);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 12) | (s7 << 20);
+  s3 = (s3 + s7 | 0) + m6 | 0; s15 ^= s3; s15 = (s15 >>> 8) | (s15 << 24);
+  s11 = s11 + s15 | 0; s7 ^= s11; s7 = (s7 >>> 7) | (s7 << 25);
+  s0 = (s0 + s5 | 0) + m14 | 0; s15 ^= s0; s15 = (s15 >>> 16) | (s15 << 16);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 12) | (s5 << 20);
+  s0 = (s0 + s5 | 0) + m10 | 0; s15 ^= s0; s15 = (s15 >>> 8) | (s15 << 24);
+  s10 = s10 + s15 | 0; s5 ^= s10; s5 = (s5 >>> 7) | (s5 << 25);
+  s1 = (s1 + s6 | 0) + m2 | 0; s12 ^= s1; s12 = (s12 >>> 16) | (s12 << 16);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 12) | (s6 << 20);
+  s1 = (s1 + s6 | 0) + m12 | 0; s12 ^= s1; s12 = (s12 >>> 8) | (s12 << 24);
+  s11 = s11 + s12 | 0; s6 ^= s11; s6 = (s6 >>> 7) | (s6 << 25);
+  s2 = (s2 + s7 | 0) + m3 | 0; s13 ^= s2; s13 = (s13 >>> 16) | (s13 << 16);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 12) | (s7 << 20);
+  s2 = (s2 + s7 | 0) + m4 | 0; s13 ^= s2; s13 = (s13 >>> 8) | (s13 << 24);
+  s8 = s8 + s13 | 0; s7 ^= s8; s7 = (s7 >>> 7) | (s7 << 25);
+  s3 = (s3 + s4 | 0) + m7 | 0; s14 ^= s3; s14 = (s14 >>> 16) | (s14 << 16);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 12) | (s4 << 20);
+  s3 = (s3 + s4 | 0) + m13 | 0; s14 ^= s3; s14 = (s14 >>> 8) | (s14 << 24);
+  s9 = s9 + s14 | 0; s4 ^= s9; s4 = (s4 >>> 7) | (s4 << 25);
+
+  out[outOff] = (s0 ^ s8) | 0;
+  out[outOff + 1 | 0] = (s1 ^ s9) | 0;
+  out[outOff + 2 | 0] = (s2 ^ s10) | 0;
+  out[outOff + 3 | 0] = (s3 ^ s11) | 0;
+  out[outOff + 4 | 0] = (s4 ^ s12) | 0;
+  out[outOff + 5 | 0] = (s5 ^ s13) | 0;
+  out[outOff + 6 | 0] = (s6 ^ s14) | 0;
+  out[outOff + 7 | 0] = (s7 ^ s15) | 0;
+}
+
+function compressParent(msg, msgOff, out, outOff) {
+  let s0 = 0x6a09e667 | 0, s1 = 0xbb67ae85 | 0, s2 = 0x3c6ef372 | 0, s3 = 0xa54ff53a | 0;
+  let s4 = 0x510e527f | 0, s5 = 0x9b05688c | 0, s6 = 0x1f83d9ab | 0, s7 = 0x5be0cd19 | 0;
+  let s8 = 0x6a09e667 | 0, s9 = 0xbb67ae85 | 0, s10 = 0x3c6ef372 | 0, s11 = 0xa54ff53a | 0;
+  let s12 = 0, s13 = 0, s14 = 64, s15 = PARENT;
+  const m0 = msg[msgOff] | 0, m1 = msg[msgOff + 1] | 0, m2 = msg[msgOff + 2] | 0, m3 = msg[msgOff + 3] | 0;
+  const m4 = msg[msgOff + 4] | 0, m5 = msg[msgOff + 5] | 0, m6 = msg[msgOff + 6] | 0, m7 = msg[msgOff + 7] | 0;
+  const m8 = msg[msgOff + 8] | 0, m9 = msg[msgOff + 9] | 0, m10 = msg[msgOff + 10] | 0, m11 = msg[msgOff + 11] | 0;
+  const m12 = msg[msgOff + 12] | 0, m13 = msg[msgOff + 13] | 0, m14 = msg[msgOff + 14] | 0, m15 = msg[msgOff + 15] | 0;
+  // All 7 rounds inline
+  s0=(s0+s4|0)+m0|0;s12^=s0;s12=(s12>>>16)|(s12<<16);s8=s8+s12|0;s4^=s8;s4=(s4>>>12)|(s4<<20);s0=(s0+s4|0)+m1|0;s12^=s0;s12=(s12>>>8)|(s12<<24);s8=s8+s12|0;s4^=s8;s4=(s4>>>7)|(s4<<25);s1=(s1+s5|0)+m2|0;s13^=s1;s13=(s13>>>16)|(s13<<16);s9=s9+s13|0;s5^=s9;s5=(s5>>>12)|(s5<<20);s1=(s1+s5|0)+m3|0;s13^=s1;s13=(s13>>>8)|(s13<<24);s9=s9+s13|0;s5^=s9;s5=(s5>>>7)|(s5<<25);s2=(s2+s6|0)+m4|0;s14^=s2;s14=(s14>>>16)|(s14<<16);s10=s10+s14|0;s6^=s10;s6=(s6>>>12)|(s6<<20);s2=(s2+s6|0)+m5|0;s14^=s2;s14=(s14>>>8)|(s14<<24);s10=s10+s14|0;s6^=s10;s6=(s6>>>7)|(s6<<25);s3=(s3+s7|0)+m6|0;s15^=s3;s15=(s15>>>16)|(s15<<16);s11=s11+s15|0;s7^=s11;s7=(s7>>>12)|(s7<<20);s3=(s3+s7|0)+m7|0;s15^=s3;s15=(s15>>>8)|(s15<<24);s11=s11+s15|0;s7^=s11;s7=(s7>>>7)|(s7<<25);s0=(s0+s5|0)+m8|0;s15^=s0;s15=(s15>>>16)|(s15<<16);s10=s10+s15|0;s5^=s10;s5=(s5>>>12)|(s5<<20);s0=(s0+s5|0)+m9|0;s15^=s0;s15=(s15>>>8)|(s15<<24);s10=s10+s15|0;s5^=s10;s5=(s5>>>7)|(s5<<25);s1=(s1+s6|0)+m10|0;s12^=s1;s12=(s12>>>16)|(s12<<16);s11=s11+s12|0;s6^=s11;s6=(s6>>>12)|(s6<<20);s1=(s1+s6|0)+m11|0;s12^=s1;s12=(s12>>>8)|(s12<<24);s11=s11+s12|0;s6^=s11;s6=(s6>>>7)|(s6<<25);s2=(s2+s7|0)+m12|0;s13^=s2;s13=(s13>>>16)|(s13<<16);s8=s8+s13|0;s7^=s8;s7=(s7>>>12)|(s7<<20);s2=(s2+s7|0)+m13|0;s13^=s2;s13=(s13>>>8)|(s13<<24);s8=s8+s13|0;s7^=s8;s7=(s7>>>7)|(s7<<25);s3=(s3+s4|0)+m14|0;s14^=s3;s14=(s14>>>16)|(s14<<16);s9=s9+s14|0;s4^=s9;s4=(s4>>>12)|(s4<<20);s3=(s3+s4|0)+m15|0;s14^=s3;s14=(s14>>>8)|(s14<<24);s9=s9+s14|0;s4^=s9;s4=(s4>>>7)|(s4<<25);
+  s0=(s0+s4|0)+m2|0;s12^=s0;s12=(s12>>>16)|(s12<<16);s8=s8+s12|0;s4^=s8;s4=(s4>>>12)|(s4<<20);s0=(s0+s4|0)+m6|0;s12^=s0;s12=(s12>>>8)|(s12<<24);s8=s8+s12|0;s4^=s8;s4=(s4>>>7)|(s4<<25);s1=(s1+s5|0)+m3|0;s13^=s1;s13=(s13>>>16)|(s13<<16);s9=s9+s13|0;s5^=s9;s5=(s5>>>12)|(s5<<20);s1=(s1+s5|0)+m10|0;s13^=s1;s13=(s13>>>8)|(s13<<24);s9=s9+s13|0;s5^=s9;s5=(s5>>>7)|(s5<<25);s2=(s2+s6|0)+m7|0;s14^=s2;s14=(s14>>>16)|(s14<<16);s10=s10+s14|0;s6^=s10;s6=(s6>>>12)|(s6<<20);s2=(s2+s6|0)+m0|0;s14^=s2;s14=(s14>>>8)|(s14<<24);s10=s10+s14|0;s6^=s10;s6=(s6>>>7)|(s6<<25);s3=(s3+s7|0)+m4|0;s15^=s3;s15=(s15>>>16)|(s15<<16);s11=s11+s15|0;s7^=s11;s7=(s7>>>12)|(s7<<20);s3=(s3+s7|0)+m13|0;s15^=s3;s15=(s15>>>8)|(s15<<24);s11=s11+s15|0;s7^=s11;s7=(s7>>>7)|(s7<<25);s0=(s0+s5|0)+m1|0;s15^=s0;s15=(s15>>>16)|(s15<<16);s10=s10+s15|0;s5^=s10;s5=(s5>>>12)|(s5<<20);s0=(s0+s5|0)+m11|0;s15^=s0;s15=(s15>>>8)|(s15<<24);s10=s10+s15|0;s5^=s10;s5=(s5>>>7)|(s5<<25);s1=(s1+s6|0)+m12|0;s12^=s1;s12=(s12>>>16)|(s12<<16);s11=s11+s12|0;s6^=s11;s6=(s6>>>12)|(s6<<20);s1=(s1+s6|0)+m5|0;s12^=s1;s12=(s12>>>8)|(s12<<24);s11=s11+s12|0;s6^=s11;s6=(s6>>>7)|(s6<<25);s2=(s2+s7|0)+m9|0;s13^=s2;s13=(s13>>>16)|(s13<<16);s8=s8+s13|0;s7^=s8;s7=(s7>>>12)|(s7<<20);s2=(s2+s7|0)+m14|0;s13^=s2;s13=(s13>>>8)|(s13<<24);s8=s8+s13|0;s7^=s8;s7=(s7>>>7)|(s7<<25);s3=(s3+s4|0)+m15|0;s14^=s3;s14=(s14>>>16)|(s14<<16);s9=s9+s14|0;s4^=s9;s4=(s4>>>12)|(s4<<20);s3=(s3+s4|0)+m8|0;s14^=s3;s14=(s14>>>8)|(s14<<24);s9=s9+s14|0;s4^=s9;s4=(s4>>>7)|(s4<<25);
+  s0=(s0+s4|0)+m3|0;s12^=s0;s12=(s12>>>16)|(s12<<16);s8=s8+s12|0;s4^=s8;s4=(s4>>>12)|(s4<<20);s0=(s0+s4|0)+m4|0;s12^=s0;s12=(s12>>>8)|(s12<<24);s8=s8+s12|0;s4^=s8;s4=(s4>>>7)|(s4<<25);s1=(s1+s5|0)+m10|0;s13^=s1;s13=(s13>>>16)|(s13<<16);s9=s9+s13|0;s5^=s9;s5=(s5>>>12)|(s5<<20);s1=(s1+s5|0)+m12|0;s13^=s1;s13=(s13>>>8)|(s13<<24);s9=s9+s13|0;s5^=s9;s5=(s5>>>7)|(s5<<25);s2=(s2+s6|0)+m13|0;s14^=s2;s14=(s14>>>16)|(s14<<16);s10=s10+s14|0;s6^=s10;s6=(s6>>>12)|(s6<<20);s2=(s2+s6|0)+m2|0;s14^=s2;s14=(s14>>>8)|(s14<<24);s10=s10+s14|0;s6^=s10;s6=(s6>>>7)|(s6<<25);s3=(s3+s7|0)+m7|0;s15^=s3;s15=(s15>>>16)|(s15<<16);s11=s11+s15|0;s7^=s11;s7=(s7>>>12)|(s7<<20);s3=(s3+s7|0)+m14|0;s15^=s3;s15=(s15>>>8)|(s15<<24);s11=s11+s15|0;s7^=s11;s7=(s7>>>7)|(s7<<25);s0=(s0+s5|0)+m6|0;s15^=s0;s15=(s15>>>16)|(s15<<16);s10=s10+s15|0;s5^=s10;s5=(s5>>>12)|(s5<<20);s0=(s0+s5|0)+m5|0;s15^=s0;s15=(s15>>>8)|(s15<<24);s10=s10+s15|0;s5^=s10;s5=(s5>>>7)|(s5<<25);s1=(s1+s6|0)+m9|0;s12^=s1;s12=(s12>>>16)|(s12<<16);s11=s11+s12|0;s6^=s11;s6=(s6>>>12)|(s6<<20);s1=(s1+s6|0)+m0|0;s12^=s1;s12=(s12>>>8)|(s12<<24);s11=s11+s12|0;s6^=s11;s6=(s6>>>7)|(s6<<25);s2=(s2+s7|0)+m11|0;s13^=s2;s13=(s13>>>16)|(s13<<16);s8=s8+s13|0;s7^=s8;s7=(s7>>>12)|(s7<<20);s2=(s2+s7|0)+m15|0;s13^=s2;s13=(s13>>>8)|(s13<<24);s8=s8+s13|0;s7^=s8;s7=(s7>>>7)|(s7<<25);s3=(s3+s4|0)+m8|0;s14^=s3;s14=(s14>>>16)|(s14<<16);s9=s9+s14|0;s4^=s9;s4=(s4>>>12)|(s4<<20);s3=(s3+s4|0)+m1|0;s14^=s3;s14=(s14>>>8)|(s14<<24);s9=s9+s14|0;s4^=s9;s4=(s4>>>7)|(s4<<25);
+  s0=(s0+s4|0)+m10|0;s12^=s0;s12=(s12>>>16)|(s12<<16);s8=s8+s12|0;s4^=s8;s4=(s4>>>12)|(s4<<20);s0=(s0+s4|0)+m7|0;s12^=s0;s12=(s12>>>8)|(s12<<24);s8=s8+s12|0;s4^=s8;s4=(s4>>>7)|(s4<<25);s1=(s1+s5|0)+m12|0;s13^=s1;s13=(s13>>>16)|(s13<<16);s9=s9+s13|0;s5^=s9;s5=(s5>>>12)|(s5<<20);s1=(s1+s5|0)+m9|0;s13^=s1;s13=(s13>>>8)|(s13<<24);s9=s9+s13|0;s5^=s9;s5=(s5>>>7)|(s5<<25);s2=(s2+s6|0)+m14|0;s14^=s2;s14=(s14>>>16)|(s14<<16);s10=s10+s14|0;s6^=s10;s6=(s6>>>12)|(s6<<20);s2=(s2+s6|0)+m3|0;s14^=s2;s14=(s14>>>8)|(s14<<24);s10=s10+s14|0;s6^=s10;s6=(s6>>>7)|(s6<<25);s3=(s3+s7|0)+m13|0;s15^=s3;s15=(s15>>>16)|(s15<<16);s11=s11+s15|0;s7^=s11;s7=(s7>>>12)|(s7<<20);s3=(s3+s7|0)+m15|0;s15^=s3;s15=(s15>>>8)|(s15<<24);s11=s11+s15|0;s7^=s11;s7=(s7>>>7)|(s7<<25);s0=(s0+s5|0)+m4|0;s15^=s0;s15=(s15>>>16)|(s15<<16);s10=s10+s15|0;s5^=s10;s5=(s5>>>12)|(s5<<20);s0=(s0+s5|0)+m0|0;s15^=s0;s15=(s15>>>8)|(s15<<24);s10=s10+s15|0;s5^=s10;s5=(s5>>>7)|(s5<<25);s1=(s1+s6|0)+m11|0;s12^=s1;s12=(s12>>>16)|(s12<<16);s11=s11+s12|0;s6^=s11;s6=(s6>>>12)|(s6<<20);s1=(s1+s6|0)+m2|0;s12^=s1;s12=(s12>>>8)|(s12<<24);s11=s11+s12|0;s6^=s11;s6=(s6>>>7)|(s6<<25);s2=(s2+s7|0)+m5|0;s13^=s2;s13=(s13>>>16)|(s13<<16);s8=s8+s13|0;s7^=s8;s7=(s7>>>12)|(s7<<20);s2=(s2+s7|0)+m8|0;s13^=s2;s13=(s13>>>8)|(s13<<24);s8=s8+s13|0;s7^=s8;s7=(s7>>>7)|(s7<<25);s3=(s3+s4|0)+m1|0;s14^=s3;s14=(s14>>>16)|(s14<<16);s9=s9+s14|0;s4^=s9;s4=(s4>>>12)|(s4<<20);s3=(s3+s4|0)+m6|0;s14^=s3;s14=(s14>>>8)|(s14<<24);s9=s9+s14|0;s4^=s9;s4=(s4>>>7)|(s4<<25);
+  s0=(s0+s4|0)+m12|0;s12^=s0;s12=(s12>>>16)|(s12<<16);s8=s8+s12|0;s4^=s8;s4=(s4>>>12)|(s4<<20);s0=(s0+s4|0)+m13|0;s12^=s0;s12=(s12>>>8)|(s12<<24);s8=s8+s12|0;s4^=s8;s4=(s4>>>7)|(s4<<25);s1=(s1+s5|0)+m9|0;s13^=s1;s13=(s13>>>16)|(s13<<16);s9=s9+s13|0;s5^=s9;s5=(s5>>>12)|(s5<<20);s1=(s1+s5|0)+m11|0;s13^=s1;s13=(s13>>>8)|(s13<<24);s9=s9+s13|0;s5^=s9;s5=(s5>>>7)|(s5<<25);s2=(s2+s6|0)+m15|0;s14^=s2;s14=(s14>>>16)|(s14<<16);s10=s10+s14|0;s6^=s10;s6=(s6>>>12)|(s6<<20);s2=(s2+s6|0)+m10|0;s14^=s2;s14=(s14>>>8)|(s14<<24);s10=s10+s14|0;s6^=s10;s6=(s6>>>7)|(s6<<25);s3=(s3+s7|0)+m14|0;s15^=s3;s15=(s15>>>16)|(s15<<16);s11=s11+s15|0;s7^=s11;s7=(s7>>>12)|(s7<<20);s3=(s3+s7|0)+m8|0;s15^=s3;s15=(s15>>>8)|(s15<<24);s11=s11+s15|0;s7^=s11;s7=(s7>>>7)|(s7<<25);s0=(s0+s5|0)+m7|0;s15^=s0;s15=(s15>>>16)|(s15<<16);s10=s10+s15|0;s5^=s10;s5=(s5>>>12)|(s5<<20);s0=(s0+s5|0)+m2|0;s15^=s0;s15=(s15>>>8)|(s15<<24);s10=s10+s15|0;s5^=s10;s5=(s5>>>7)|(s5<<25);s1=(s1+s6|0)+m5|0;s12^=s1;s12=(s12>>>16)|(s12<<16);s11=s11+s12|0;s6^=s11;s6=(s6>>>12)|(s6<<20);s1=(s1+s6|0)+m3|0;s12^=s1;s12=(s12>>>8)|(s12<<24);s11=s11+s12|0;s6^=s11;s6=(s6>>>7)|(s6<<25);s2=(s2+s7|0)+m0|0;s13^=s2;s13=(s13>>>16)|(s13<<16);s8=s8+s13|0;s7^=s8;s7=(s7>>>12)|(s7<<20);s2=(s2+s7|0)+m1|0;s13^=s2;s13=(s13>>>8)|(s13<<24);s8=s8+s13|0;s7^=s8;s7=(s7>>>7)|(s7<<25);s3=(s3+s4|0)+m6|0;s14^=s3;s14=(s14>>>16)|(s14<<16);s9=s9+s14|0;s4^=s9;s4=(s4>>>12)|(s4<<20);s3=(s3+s4|0)+m4|0;s14^=s3;s14=(s14>>>8)|(s14<<24);s9=s9+s14|0;s4^=s9;s4=(s4>>>7)|(s4<<25);
+  s0=(s0+s4|0)+m9|0;s12^=s0;s12=(s12>>>16)|(s12<<16);s8=s8+s12|0;s4^=s8;s4=(s4>>>12)|(s4<<20);s0=(s0+s4|0)+m14|0;s12^=s0;s12=(s12>>>8)|(s12<<24);s8=s8+s12|0;s4^=s8;s4=(s4>>>7)|(s4<<25);s1=(s1+s5|0)+m11|0;s13^=s1;s13=(s13>>>16)|(s13<<16);s9=s9+s13|0;s5^=s9;s5=(s5>>>12)|(s5<<20);s1=(s1+s5|0)+m5|0;s13^=s1;s13=(s13>>>8)|(s13<<24);s9=s9+s13|0;s5^=s9;s5=(s5>>>7)|(s5<<25);s2=(s2+s6|0)+m8|0;s14^=s2;s14=(s14>>>16)|(s14<<16);s10=s10+s14|0;s6^=s10;s6=(s6>>>12)|(s6<<20);s2=(s2+s6|0)+m12|0;s14^=s2;s14=(s14>>>8)|(s14<<24);s10=s10+s14|0;s6^=s10;s6=(s6>>>7)|(s6<<25);s3=(s3+s7|0)+m15|0;s15^=s3;s15=(s15>>>16)|(s15<<16);s11=s11+s15|0;s7^=s11;s7=(s7>>>12)|(s7<<20);s3=(s3+s7|0)+m1|0;s15^=s3;s15=(s15>>>8)|(s15<<24);s11=s11+s15|0;s7^=s11;s7=(s7>>>7)|(s7<<25);s0=(s0+s5|0)+m13|0;s15^=s0;s15=(s15>>>16)|(s15<<16);s10=s10+s15|0;s5^=s10;s5=(s5>>>12)|(s5<<20);s0=(s0+s5|0)+m3|0;s15^=s0;s15=(s15>>>8)|(s15<<24);s10=s10+s15|0;s5^=s10;s5=(s5>>>7)|(s5<<25);s1=(s1+s6|0)+m0|0;s12^=s1;s12=(s12>>>16)|(s12<<16);s11=s11+s12|0;s6^=s11;s6=(s6>>>12)|(s6<<20);s1=(s1+s6|0)+m10|0;s12^=s1;s12=(s12>>>8)|(s12<<24);s11=s11+s12|0;s6^=s11;s6=(s6>>>7)|(s6<<25);s2=(s2+s7|0)+m2|0;s13^=s2;s13=(s13>>>16)|(s13<<16);s8=s8+s13|0;s7^=s8;s7=(s7>>>12)|(s7<<20);s2=(s2+s7|0)+m6|0;s13^=s2;s13=(s13>>>8)|(s13<<24);s8=s8+s13|0;s7^=s8;s7=(s7>>>7)|(s7<<25);s3=(s3+s4|0)+m4|0;s14^=s3;s14=(s14>>>16)|(s14<<16);s9=s9+s14|0;s4^=s9;s4=(s4>>>12)|(s4<<20);s3=(s3+s4|0)+m7|0;s14^=s3;s14=(s14>>>8)|(s14<<24);s9=s9+s14|0;s4^=s9;s4=(s4>>>7)|(s4<<25);
+  s0=(s0+s4|0)+m11|0;s12^=s0;s12=(s12>>>16)|(s12<<16);s8=s8+s12|0;s4^=s8;s4=(s4>>>12)|(s4<<20);s0=(s0+s4|0)+m15|0;s12^=s0;s12=(s12>>>8)|(s12<<24);s8=s8+s12|0;s4^=s8;s4=(s4>>>7)|(s4<<25);s1=(s1+s5|0)+m5|0;s13^=s1;s13=(s13>>>16)|(s13<<16);s9=s9+s13|0;s5^=s9;s5=(s5>>>12)|(s5<<20);s1=(s1+s5|0)+m0|0;s13^=s1;s13=(s13>>>8)|(s13<<24);s9=s9+s13|0;s5^=s9;s5=(s5>>>7)|(s5<<25);s2=(s2+s6|0)+m1|0;s14^=s2;s14=(s14>>>16)|(s14<<16);s10=s10+s14|0;s6^=s10;s6=(s6>>>12)|(s6<<20);s2=(s2+s6|0)+m9|0;s14^=s2;s14=(s14>>>8)|(s14<<24);s10=s10+s14|0;s6^=s10;s6=(s6>>>7)|(s6<<25);s3=(s3+s7|0)+m8|0;s15^=s3;s15=(s15>>>16)|(s15<<16);s11=s11+s15|0;s7^=s11;s7=(s7>>>12)|(s7<<20);s3=(s3+s7|0)+m6|0;s15^=s3;s15=(s15>>>8)|(s15<<24);s11=s11+s15|0;s7^=s11;s7=(s7>>>7)|(s7<<25);s0=(s0+s5|0)+m14|0;s15^=s0;s15=(s15>>>16)|(s15<<16);s10=s10+s15|0;s5^=s10;s5=(s5>>>12)|(s5<<20);s0=(s0+s5|0)+m10|0;s15^=s0;s15=(s15>>>8)|(s15<<24);s10=s10+s15|0;s5^=s10;s5=(s5>>>7)|(s5<<25);s1=(s1+s6|0)+m2|0;s12^=s1;s12=(s12>>>16)|(s12<<16);s11=s11+s12|0;s6^=s11;s6=(s6>>>12)|(s6<<20);s1=(s1+s6|0)+m12|0;s12^=s1;s12=(s12>>>8)|(s12<<24);s11=s11+s12|0;s6^=s11;s6=(s6>>>7)|(s6<<25);s2=(s2+s7|0)+m3|0;s13^=s2;s13=(s13>>>16)|(s13<<16);s8=s8+s13|0;s7^=s8;s7=(s7>>>12)|(s7<<20);s2=(s2+s7|0)+m4|0;s13^=s2;s13=(s13>>>8)|(s13<<24);s8=s8+s13|0;s7^=s8;s7=(s7>>>7)|(s7<<25);s3=(s3+s4|0)+m7|0;s14^=s3;s14=(s14>>>16)|(s14<<16);s9=s9+s14|0;s4^=s9;s4=(s4>>>12)|(s4<<20);s3=(s3+s4|0)+m13|0;s14^=s3;s14=(s14>>>8)|(s14<<24);s9=s9+s14|0;s4^=s9;s4=(s4>>>7)|(s4<<25);
+  out[outOff]=(s0^s8)|0;out[outOff+1]=(s1^s9)|0;out[outOff+2]=(s2^s10)|0;out[outOff+3]=(s3^s11)|0;out[outOff+4]=(s4^s12)|0;out[outOff+5]=(s5^s13)|0;out[outOff+6]=(s6^s14)|0;out[outOff+7]=(s7^s15)|0;
+}
+
+function hash(input) {
+  const length = input.length | 0;
+  let inputWords = null;
+  if (IS_LITTLE_ENDIAN && ((input.byteOffset & 3) === 0) && (length >= 64)) {
+    try { inputWords = new Uint32Array(input.buffer, input.byteOffset, length >> 2); } catch (e) { inputWords = null; }
+  }
+  const numChunks = Math.ceil(length / CHUNK_LEN) || 1;
+  const maxDepth = (Math.ceil(Math.log2(numChunks + 1)) + 2) | 0;
+  const stack = ensureCvStack(maxDepth);
+  let stackPos = 0, chunkCounter = 0, offset = 0;
+  const fullChunksEnd = length > 0 ? (Math.floor((length - 1) / CHUNK_LEN) * CHUNK_LEN) | 0 : 0;
+
+  while (offset < fullChunksEnd) {
+    stack[stackPos]=0x6a09e667;stack[stackPos+1]=0xbb67ae85;stack[stackPos+2]=0x3c6ef372;stack[stackPos+3]=0xa54ff53a;
+    stack[stackPos+4]=0x510e527f;stack[stackPos+5]=0x9b05688c;stack[stackPos+6]=0x1f83d9ab;stack[stackPos+7]=0x5be0cd19;
+    for (let block = 0; block < 16; block = block + 1 | 0) {
+      const blockFlags = (block === 0 ? CHUNK_START : 0) | (block === 15 ? CHUNK_END : 0);
+      if (inputWords !== null) {
+        compressTruncated(stack, stackPos, inputWords, offset >> 2, stack, stackPos, chunkCounter, BLOCK_LEN, blockFlags);
+      } else {
+        readWordsLE(input, offset, blockWords, 16);
+        compressTruncated(stack, stackPos, blockWords, 0, stack, stackPos, chunkCounter, BLOCK_LEN, blockFlags);
+      }
+      offset = offset + BLOCK_LEN | 0;
+    }
+    chunkCounter = chunkCounter + 1 | 0;
+    stackPos = stackPos + 8 | 0;
+    let total = chunkCounter | 0;
+    while ((total & 1) === 0) {
+      stackPos = stackPos - 16 | 0;
+      compressParent(stack, stackPos, stack, stackPos);
+      stackPos = stackPos + 8 | 0;
+      total = total >> 1;
+    }
+  }
+
+  const remaining = length - offset | 0;
+  if (remaining > 0 || length === 0) {
+    stack[stackPos]=0x6a09e667;stack[stackPos+1]=0xbb67ae85;stack[stackPos+2]=0x3c6ef372;stack[stackPos+3]=0xa54ff53a;
+    stack[stackPos+4]=0x510e527f;stack[stackPos+5]=0x9b05688c;stack[stackPos+6]=0x1f83d9ab;stack[stackPos+7]=0x5be0cd19;
+    const numFullBlocks = remaining > 0 ? ((remaining - 1) / BLOCK_LEN) | 0 : 0;
+    for (let block = 0; block < numFullBlocks; block = block + 1 | 0) {
+      const blockFlags = (block === 0 ? CHUNK_START : 0);
+      if (inputWords !== null && (offset + BLOCK_LEN) <= (length & ~3)) {
+        compressTruncated(stack, stackPos, inputWords, offset >> 2, stack, stackPos, chunkCounter, BLOCK_LEN, blockFlags);
+      } else {
+        readWordsLE(input, offset, blockWords, 16);
+        compressTruncated(stack, stackPos, blockWords, 0, stack, stackPos, chunkCounter, BLOCK_LEN, blockFlags);
+      }
+      offset = offset + BLOCK_LEN | 0;
+    }
+    const lastBlockLen = length - offset | 0;
+    const isFirstBlock = numFullBlocks === 0;
+    const lastFlags = (isFirstBlock ? CHUNK_START : 0) | CHUNK_END;
+    readPartialBlock(input, offset, lastBlockLen, blockWords);
+    if (stackPos === 0) {
+      compressTruncated(stack, 0, blockWords, 0, outWords, 0, chunkCounter, lastBlockLen, lastFlags | ROOT);
+      return wordsToBytes(outWords);
+    }
+    compressTruncated(stack, stackPos, blockWords, 0, stack, stackPos, chunkCounter, lastBlockLen, lastFlags);
+    stackPos = stackPos + 8 | 0;
+  }
+
+  while (stackPos > 16) {
+    stackPos = stackPos - 16 | 0;
+    compressParent(stack, stackPos, stack, stackPos);
+    stackPos = stackPos + 8 | 0;
+  }
+  stackPos = stackPos - 16 | 0;
+  compressTruncated(IV_ARRAY, 0, stack, stackPos, outWords, 0, 0, BLOCK_LEN, PARENT | ROOT);
+  return wordsToBytes(outWords);
+}
+
+// Pooled output conversion - writes to shared buffer, returns copy (Haiku optimization #4)
+function wordsToBytes(words) {
+  for (let i = 0; i < 8; i = i + 1 | 0) {
+    const w = words[i] | 0;
+    const j = i << 2;
+    outputBuffer[j] = w & 0xff;
+    outputBuffer[j + 1 | 0] = (w >>> 8) & 0xff;
+    outputBuffer[j + 2 | 0] = (w >>> 16) & 0xff;
+    outputBuffer[j + 3 | 0] = (w >>> 24) & 0xff;
+  }
+  return new Uint8Array(outputBuffer); // Return copy since buffer is reused
+}
+
+function toHex(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
+  return s;
+}
+
+const logEl = document.getElementById('log');
+function log(msg) { logEl.innerHTML += msg + '\n'; }
+function clear() { logEl.innerHTML = ''; }
+
+function runTests() {
+  clear();
+  log('BLAKE3 ULTRA v2 - Test Vectors\n' + '='.repeat(50) + '\n');
+  log('Endianness: ' + (IS_LITTLE_ENDIAN ? 'Little (zero-copy enabled)' : 'Big'));
+  function genInput(n) { const a = new Uint8Array(n); for (let i = 0; i < n; i++) a[i] = i % 251; return a; }
+  const tests = [
+    [0, 'af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262'],
+    [1, '2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213'],
+    [64, '4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98'],
+    [65, 'de1e5fa0be70df6d2be8fffd0e99ceaa8eb6e8c93a63f2d8d1c30ecb6b263dee'],
+    [1024, '42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7'],
+    [1025, 'd00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444'],
+    [2048, 'e776b6028c7cd22a4d0ba182a8bf62205d2ef576467e838ed6f2529b85fba24a'],
+    [8192, 'aae792484c8efe4f19e2ca7d371d8c467ffb10748d8a5a1ae579948f718a2a63'],
+  ];
+  let passed = 0;
+  for (const [len, expected] of tests) {
+    const result = toHex(hash(genInput(len)));
+    const ok = result === expected;
+    if (ok) passed++;
+    log(`len=${String(len).padStart(5)}: <span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>`);
+    if (!ok) { log(`  Expected: ${expected}`); log(`  Got:      ${result}`); }
+  }
+  log('\n' + '='.repeat(50));
+  log(`${passed}/${tests.length} tests passed`);
+}
+
+function benchmark(mib) {
+  clear();
+  log(`BLAKE3 ULTRA v2 - ${mib} MiB Benchmark\n` + '='.repeat(50) + '\n');
+  log('Endianness: ' + (IS_LITTLE_ENDIAN ? 'Little (zero-copy enabled)' : 'Big'));
+  log(`Allocating ${mib} MiB buffer...`);
+  setTimeout(() => {
+    const size = mib * 1024 * 1024;
+    const data = new Uint8Array(size);
+    for (let i = 0; i < size; i += 65536) crypto.getRandomValues(data.subarray(i, Math.min(i + 65536, size)));
+    log('Extended JIT warmup (30 iterations on 2MB)...');
+    const warmupSize = Math.min(2 * 1024 * 1024, size);
+    for (let i = 0; i < 30; i++) hash(data.subarray(0, warmupSize));
+    log('Running benchmark (5 runs, best of 5)...\n');
+    const speeds = [];
+    for (let run = 1; run <= 5; run++) {
+      const start = performance.now();
+      const result = hash(data);
+      const elapsed = performance.now() - start;
+      const mibPerSec = (mib / (elapsed / 1000));
+      const gibPerSec = mibPerSec / 1024;
+      speeds.push(mibPerSec);
+      log(`Run ${run}: ${mibPerSec.toFixed(1)} MiB/s (${gibPerSec.toFixed(3)} GiB/s) - ${elapsed.toFixed(0)}ms`);
+      log(`       Hash: ${toHex(result).slice(0, 32)}...`);
+    }
+    const bestSpeed = Math.max(...speeds);
+    const avgSpeed = speeds.reduce((a, b) => a + b, 0) / speeds.length;
+    const bestGib = bestSpeed / 1024;
+    const avgGib = avgSpeed / 1024;
+    log('\n' + '='.repeat(50));
+    log(`<span class="speed">Best:    ${bestSpeed.toFixed(1)} MiB/s (${bestGib.toFixed(3)} GiB/s)</span>`);
+    log(`<span class="speed">Average: ${avgSpeed.toFixed(1)} MiB/s (${avgGib.toFixed(3)} GiB/s)</span>`);
+    if (bestGib >= 2.0) log('\n*** 2.0+ GiB/s TARGET ACHIEVED! ***');
+    else if (bestGib >= 1.5) log('\n*** EXCELLENT: 1.5+ GiB/s ***');
+    else if (bestGib >= 1.0) log('\n*** GREAT: 1.0+ GiB/s ***');
+    else if (bestGib >= 0.9) log('\n*** GOOD: 0.9+ GiB/s ***');
+  }, 100);
+}
+
+setTimeout(runTests, 500);
+</script>
+</body>
+</html>
