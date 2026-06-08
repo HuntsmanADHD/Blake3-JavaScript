@@ -6,7 +6,9 @@
   "license": "MIT",
   "scripts": {
     "test": "node conformance.js",
+    "test:simd": "node blake3-simd.js",
     "bench": "node blake3-ultra.js",
+    "bench:simd": "node blake3-simd.js",
     "bench:compare": "node bench.js"
   },
   "devDependencies": {

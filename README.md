@@ -3,9 +3,10 @@ A high performance pure JavaScript implementation of the BLAKE3 cryptographic ha
 
   ## Performance
 
-  - .9~1.0 GiB/s on modern browsers
-  - 100% pure JavaScript no WebAssembly, no SIMD, no Web Workers
+  - .9~1.0 GiB/s on modern browsers 100% pure JavaScript no WebAssembly, no SIMD, no Web Workers
   - ~8x faster than @noble/hashes BLAKE3 in pure JS
+  - Fastest scalar pure JS entry in the BLAKE3 bounty field, see COMPARISON.md
+  - Optional WASM SIMD build reaches ~1.7 GiB/s, see below
   - Tested on Intel Core i7-14700K
 
   ## Features
@@ -32,8 +33,29 @@ A high performance pure JavaScript implementation of the BLAKE3 cryptographic ha
   Importing the module does not run the benchmark. Run it directly for the
   Node benchmark, or open blake3-ultra-v2.html in a browser.
 
+  ## Optional WASM SIMD build
+
+  blake3-simd.js is a separate build that adds step 9 from the Fleek blog, a
+  4 wide i32x4 compress4x generated as WebAssembly SIMD at load time. No .wasm
+  file is shipped, the module is assembled from JS and compiled synchronously, so
+  hash stays synchronous and it is still one file.
+
+  - ~1.7 GiB/s on bulk input, beats every other faithful step 9 entry in the field
+  - Plain hash mode, 32 byte output only, little endian fast path with scalar fallback
+  - Passes all 35 official hash mode vectors
+  - WASM bytecode follows the Fleek blog, orchestration adapted from the Bk3JS entry
+
+  ```js
+  const { hash, toHex } = require('./blake3-simd.js');
+  toHex(hash(data));
+  ```
+
+  See COMPARISON.md for the full on-machine table against the bounty entries.
+
   ## Testing
 
   - `npm test` runs the official test vectors, 35 lengths x 3 modes x 32 byte and full XOF output
+  - `npm run test:simd` verifies the WASM SIMD build against the 35 hash mode vectors
   - `npm run bench` runs the Node throughput benchmark
+  - `npm run bench:simd` self-tests and benchmarks the WASM SIMD build
   - `npm run bench:compare` runs a head to head against @noble/hashes and native SHA
