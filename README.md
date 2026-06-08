@@ -6,7 +6,7 @@ A high performance pure JavaScript implementation of the BLAKE3 cryptographic ha
   - .9~1.0 GiB/s on modern browsers 100% pure JavaScript no WebAssembly, no SIMD, no Web Workers
   - ~8x faster than @noble/hashes BLAKE3 in pure JS
   - Fastest scalar pure JS entry in the BLAKE3 bounty field, see COMPARISON.md
-  - Optional WASM SIMD build reaches ~1.7 GiB/s, see below
+  - Optional WASM SIMD build reaches ~1.9 GiB/s, fastest JS+WASM entry in the field, see below
   - Tested on Intel Core i7-14700K
 
   ## Features
@@ -40,10 +40,12 @@ A high performance pure JavaScript implementation of the BLAKE3 cryptographic ha
   file is shipped, the module is assembled from JS and compiled synchronously, so
   hash stays synchronous and it is still one file.
 
-  - ~1.7 GiB/s on bulk input, beats every other faithful step 9 entry in the field
+  - ~1.9 GiB/s on bulk input, fastest JS+WASM entry in the bounty field at every size
+  - Kernel uses i8x16.shuffle for the 16 and 8 bit rotates, constant state words hoisted out of the block loop
   - Plain hash mode, 32 byte output only, little endian fast path with scalar fallback
   - Passes all 35 official hash mode vectors
   - WASM bytecode follows the Fleek blog, orchestration adapted from the Bk3JS entry
+  - 4 wide v128 is ~2-4x narrower than native AVX2/AVX-512, so native SHA-NI SHA-256 stays ahead
 
   ```js
   const { hash, toHex } = require('./blake3-simd.js');

@@ -528,10 +528,23 @@ function hash(input) {
   // ---- SIMD bulk: whole 4-chunk (4096-byte) groups, leaving >=1 byte for the tail ----
   const fourGroupEnd = length > 0 ? (((length - 1) / 4096) | 0) * 4096 : 0;
   let w = 0; // word cursor into `words`
+  if (offset < fourGroupEnd) {
+    // State words $24..$27 (IV) and $30 (block length) are constant and are not
+    // written back by compress4x, so set them once instead of every block.
+    for (let i = 0; i < 4; i++) {
+      wasmU32[96 + i] = 0x6a09e667; wasmU32[100 + i] = 0xbb67ae85;
+      wasmU32[104 + i] = 0x3c6ef372; wasmU32[108 + i] = 0xa54ff53a;
+      wasmU32[120 + i] = BLOCK_LEN;
+    }
+  }
   while (offset < fourGroupEnd) {
     for (let i = 0; i < 8; i++) {                 // broadcast IV to the 4 lanes' running CV
       const c = IV[i], s = (16 + i) * 4;
       wasmU32[s] = c; wasmU32[s + 1] = c; wasmU32[s + 2] = c; wasmU32[s + 3] = c;
+    }
+    for (let i = 0; i < 4; i++) {                 // per-group counters (one per lane/chunk)
+      wasmU32[112 + i] = (chunkCounter + i) | 0;
+      wasmU32[116 + i] = ((chunkCounter + i) / 0x100000000) | 0;
     }
     for (let blk = 0; blk < 16; blk++) {
       for (let i = 0; i < 64; i += 4, w++) {      // transpose: lane j = chunk j's word
@@ -541,13 +554,7 @@ function hash(input) {
         wasmU32[i + 3] = words[w + 768];
       }
       const flags = (blk === 0 ? CHUNK_START : 0) | (blk === 15 ? CHUNK_END : 0);
-      for (let i = 0; i < 4; i++) {
-        wasmU32[96 + i] = 0x6a09e667; wasmU32[100 + i] = 0xbb67ae85;
-        wasmU32[104 + i] = 0x3c6ef372; wasmU32[108 + i] = 0xa54ff53a;
-        wasmU32[112 + i] = (chunkCounter + i) | 0;
-        wasmU32[116 + i] = ((chunkCounter + i) / 0x100000000) | 0;
-        wasmU32[120 + i] = BLOCK_LEN; wasmU32[124 + i] = flags;
-      }
+      wasmU32[124] = flags; wasmU32[125] = flags; wasmU32[126] = flags; wasmU32[127] = flags;
       compress4x();
     }
     for (let c = 0; c < 4; c++) {                 // pull the 4 chunk CVs off the lanes

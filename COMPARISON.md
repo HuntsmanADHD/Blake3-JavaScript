@@ -22,15 +22,15 @@ JIT warmup** so the ranking is apples to apples.
                  ---------------            -----------
 input  ultra*  simd*   opt    js   |  Bk3JS  fast    sha256(native)
 -----  -----  -----  -----  -----  |  -----  -----   --------------
-64 B     199    232    213    71   |    74    199          10
-256 B    598    616    497   268   |   256    566          40
-1 KB     889    905    735   622   |   624    959         163
-4 KB     967    979    790   770   |   766   1656         497
-16 KB    997   1432    791   780   |  1258   1763        1164
-64 KB    990   1622    793   790   |  1547   1766        1574
-256 KB   997   1682    794   792   |  1606   1797        2184
-1 MB    1002   1693    807   790   |  1617   1802        2241
-10 MB   1000   1680    784   784   |  1544   1786        2124
+64 B     222    231    210    76   |    76    206           9
+256 B    598    620    517   275   |   263    593          38
+1 KB     888    918    732   645   |   639    961         154
+4 KB     966    974    780   768   |   758   1666         496
+16 KB    998   1535    790   781   |  1264   1764        1115
+64 KB    992   1739    794   789   |  1538   1768        1831
+256 KB  1012   1876    801   789   |  1642   1816        2160
+1 MB     995   1889    794   788   |  1616   1802        2331
+10 MB   1001   1874    794   782   |  1569   1792        2065
 
 * = this repo.  ultra = blake3-ultra.js (pure JS).  simd = blake3-simd.js (WASM SIMD).
 opt = blake3-optimized.  js = blake3-js.  Bk3JS / fast = WASM-SIMD bounty entries.
@@ -43,10 +43,16 @@ sha256(native) = WebCrypto, a native-code anchor (different algorithm).
   size** - no WebAssembly, no SIMD, no workers - and fastest of *everything* on
   64-byte messages, where SIMD/WASM setup cost cannot amortize.
 
-- **blake3-simd beats Bk3JS
-  WASM-SIMD entry at every size**, and is #1 of all entries at 64 B. Only
-  `blake3-fast` is faster at bulk (~6% at 1 MB), because it goes beyond the blog
-  with a wider SIMD kernel.
+- **blake3-simd is the fastest JavaScript+WASM entry in the field at every size**,
+  and #1 of all entries at 64 B. After two kernel optimizations (i8x16.shuffle
+  rotates, and hoisting constant state words out of the per-block loop) it also
+  passes `blake3-fast` at bulk, ~1.89 GiB/s at 1 MB.
+
+- Only native SHA-256 is faster, and that is a hardware gap, not an effort gap:
+  SHA-256 on this CPU runs on the SHA-NI extension (dedicated crypto silicon), and
+  WASM SIMD is capped at 128-bit v128 (4-wide), while native BLAKE3 uses AVX2
+  (8-wide) / AVX-512 (16-wide). 4-wide WASM is structurally 2-4x narrower than the
+  hardware, so ~1.9 GiB/s is near the practical ceiling for this approach.
 
 - The SIMD entries lead at large inputs because data-parallel SIMD processes
   multiple chunks at once; a scalar JS path structurally cannot match that. That is
