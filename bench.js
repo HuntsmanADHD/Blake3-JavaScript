@@ -2,9 +2,10 @@
 // ============================================================================
 // Head-to-head throughput benchmark.
 //
-// Compares this pure-JS BLAKE3 against:
-//   - Node's native (OpenSSL C) SHA-256 / SHA-512  -> "optimized native" anchor
-//   - @noble/hashes BLAKE3 (pure JS)               -> direct pure-JS peer (if installed)
+// Compares this repo's two builds against:
+//   - blake3-ultra (pure JS) and blake3-simd (WASM SIMD)  -> this repo
+//   - Node's native (OpenSSL C) SHA-256 / SHA-512         -> "optimized native" anchor
+//   - @noble/hashes BLAKE3 (pure JS)                      -> direct pure-JS peer (if installed)
 //
 // Note: SHA-256/512 are different algorithms; they are anchors for "how fast is
 // the machine's optimized native hashing", not apples-to-apples with BLAKE3.
@@ -14,6 +15,7 @@
 // ============================================================================
 const crypto = require('crypto');
 const { hash } = require('./blake3-ultra.js');
+const { hash: hashSimd } = require('./blake3-simd.js');
 
 let nobleBlake3 = null;
 try {
@@ -30,6 +32,7 @@ function makeData(size) {
 
 const competitors = [
   { name: 'blake3-ultra (this, pure JS)', fn: (d) => hash(d) },
+  { name: 'blake3-simd (this, WASM SIMD)', fn: (d) => hashSimd(d) },
   { name: 'node sha256 (native C)',       fn: (d) => crypto.createHash('sha256').update(d).digest() },
   { name: 'node sha512 (native C)',       fn: (d) => crypto.createHash('sha512').update(d).digest() },
 ];
