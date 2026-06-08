@@ -470,12 +470,18 @@ const { compress4x, wasmU32 } = (function () {
     3, 0, 10, 2, 6, 4, 7, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13,
   ];
   let mi = 0;
+  // rotr by 16 and by 8 are byte permutations -> one i8x16.shuffle (0xfd 0x0d)
+  // instead of shr_u + shl + v128.or. Per i32 lane: rotr16 = bytes [2,3,0,1],
+  // rotr8 = bytes [1,2,3,0]; tiled across the 4 lanes of the v128.
+  const SHUF16 = [2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13];
+  const SHUF8 = [1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12];
   const gi = (a, b, c, d, dRot, bRot) => {
     const m = M[mi++];
+    const dShuf = dRot === 16 ? SHUF16 : SHUF8; // dRot is always 16 or 8
     put([
       0x20, a, 0x20, m, 0xfd, 174, 1, 0xfd, 174, 1, 0x22, a, // s[a]=s[a]+s[m]+s[b]; (b loaded outside)
       0x20, d, 0xfd, 81, 0x22, d,                            // s[d]^=s[a]
-      0x41, dRot, 0xfd, 173, 1, 0x20, d, 0x41, 32 - dRot, 0xfd, 171, 1, 0xfd, 80, 0x22, d, // s[d]=rotr(dRot)
+      0x20, d, 0xfd, 0x0d, ...dShuf, 0x22, d,                // s[d]=rotr(dRot) via i8x16.shuffle
       0x20, c, 0xfd, 174, 1, 0x22, c,                        // s[c]+=s[d]
       0x20, b, 0xfd, 81, 0x22, b,                            // s[b]^=s[c]
       0x41, bRot, 0xfd, 173, 1, 0x20, b, 0x41, 32 - bRot, 0xfd, 171, 1, 0xfd, 80, // s[b]=rotr(bRot)
