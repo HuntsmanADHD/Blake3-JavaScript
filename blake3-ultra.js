@@ -17,6 +17,9 @@ const CHUNK_START = 1;
 const CHUNK_END = 2;
 const PARENT = 4;
 const ROOT = 8;
+const KEYED_HASH = 16;
+const DERIVE_KEY_CONTEXT = 32;
+const DERIVE_KEY_MATERIAL = 64;
 
 const IV = new Uint32Array([
   0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
@@ -427,7 +430,30 @@ function compress(cv, cvOff, msg, msgOff, out, outOff, counter, blockLen, flags,
   out[outOff + 7 | 0] = (s7 ^ s15) | 0;
 }
 
-function hash(input) {
+// Emit `outLen` bytes from the root node. outLen===32 takes the fast single-
+// block path; longer outputs re-run the root compression with an incrementing
+// output-block counter (BLAKE3 extendable output / XOF).
+function finalize(cv, cvOff, msg, msgOff, blockLen, flags, outLen) {
+  if (outLen === 32) {
+    compress(cv, cvOff, msg, msgOff, outWords, 0, 0, blockLen, flags | ROOT, true);
+    return wordsToBytes(outWords);
+  }
+  const out = new Uint8Array(outLen);
+  let pos = 0;
+  let counter = 0;
+  while (pos < outLen) {
+    compress(cv, cvOff, msg, msgOff, outWords, 0, counter, blockLen, flags | ROOT, false);
+    const take = (outLen - pos) < 64 ? (outLen - pos) : 64;
+    for (let b = 0; b < take; b = b + 1 | 0) {
+      out[pos + b | 0] = (outWords[b >> 2] >>> ((b & 3) << 3)) & 0xff;
+    }
+    pos = pos + take | 0;
+    counter = counter + 1 | 0;
+  }
+  return out;
+}
+
+function hashCore(input, keyWords, baseFlags, outLen) {
   const length = input.length | 0;
 
   let inputWords = null;
@@ -454,11 +480,11 @@ function hash(input) {
   const fullChunksEnd = length > 0 ? (Math.floor((length - 1) / CHUNK_LEN) * CHUNK_LEN) | 0 : 0;
 
   while (offset < fullChunksEnd) {
-    stack.set(IV, stackPos);
+    stack.set(keyWords, stackPos);
 
     for (let block = 0; block < 16; block = block + 1 | 0) {
       const blockFlags = (block === 0 ? CHUNK_START : 0) |
-                         (block === 15 ? CHUNK_END : 0);
+                         (block === 15 ? CHUNK_END : 0) | baseFlags;
 
       if (inputWords !== null) {
         compress(stack, stackPos, inputWords, offset >> 2, stack, stackPos,
@@ -477,7 +503,7 @@ function hash(input) {
     let total = chunkCounter | 0;
     while ((total & 1) === 0) {
       stackPos = stackPos - 16 | 0;
-      compress(IV, 0, stack, stackPos, stack, stackPos, 0, BLOCK_LEN, PARENT, true);
+      compress(keyWords, 0, stack, stackPos, stack, stackPos, 0, BLOCK_LEN, PARENT | baseFlags, true);
       stackPos = stackPos + 8 | 0;
       total = total >> 1;
     }
@@ -486,12 +512,12 @@ function hash(input) {
   const remaining = length - offset | 0;
 
   if (remaining > 0 || length === 0) {
-    stack.set(IV, stackPos);
+    stack.set(keyWords, stackPos);
 
     const numFullBlocks = remaining > 0 ? ((remaining - 1) / BLOCK_LEN) | 0 : 0;
 
     for (let block = 0; block < numFullBlocks; block = block + 1 | 0) {
-      const blockFlags = (block === 0 ? CHUNK_START : 0);
+      const blockFlags = (block === 0 ? CHUNK_START : 0) | baseFlags;
 
       if (inputWords !== null && (offset + BLOCK_LEN) <= (length & ~3)) {
         compress(stack, stackPos, inputWords, offset >> 2, stack, stackPos,
@@ -506,14 +532,12 @@ function hash(input) {
 
     const lastBlockLen = length - offset | 0;
     const isFirstBlock = numFullBlocks === 0;
-    const lastFlags = (isFirstBlock ? CHUNK_START : 0) | CHUNK_END;
+    const lastFlags = ((isFirstBlock ? CHUNK_START : 0) | CHUNK_END) | baseFlags;
 
     readPartialBlock(input, offset, lastBlockLen, blockWords);
 
     if (stackPos === 0) {
-      compress(stack, 0, blockWords, 0, outWords, 0,
-               chunkCounter, lastBlockLen, lastFlags | ROOT, true);
-      return wordsToBytes(outWords);
+      return finalize(stack, 0, blockWords, 0, lastBlockLen, lastFlags, outLen);
     }
 
     compress(stack, stackPos, blockWords, 0, stack, stackPos,
@@ -523,14 +547,69 @@ function hash(input) {
 
   while (stackPos > 16) {
     stackPos = stackPos - 16 | 0;
-    compress(IV, 0, stack, stackPos, stack, stackPos, 0, BLOCK_LEN, PARENT, true);
+    compress(keyWords, 0, stack, stackPos, stack, stackPos, 0, BLOCK_LEN, PARENT | baseFlags, true);
     stackPos = stackPos + 8 | 0;
   }
 
   stackPos = stackPos - 16 | 0;
-  compress(IV, 0, stack, stackPos, outWords, 0, 0, BLOCK_LEN, PARENT | ROOT, true);
+  return finalize(keyWords, 0, stack, stackPos, BLOCK_LEN, PARENT | baseFlags, outLen);
+}
 
-  return wordsToBytes(outWords);
+// Plain hashing (default mode), 32-byte output.
+function hash(input) {
+  return hashCore(input, IV, 0, 32);
+}
+
+// Extendable output: plain hash with arbitrary output length (bytes).
+function hashXOF(input, outLen) {
+  return hashCore(input, IV, 0, outLen | 0);
+}
+
+// Convert a 32-byte key into 8 little-endian words.
+function keyToWords(keyBytes) {
+  const w = new Uint32Array(8);
+  for (let i = 0; i < 8; i = i + 1 | 0) {
+    const o = i << 2;
+    w[i] = (keyBytes[o] |
+            (keyBytes[o + 1 | 0] << 8) |
+            (keyBytes[o + 2 | 0] << 16) |
+            (keyBytes[o + 3 | 0] << 24)) | 0;
+  }
+  return w;
+}
+
+// Keyed hashing (MAC / PRF). `key` must be exactly 32 bytes.
+function keyedHash(key, input) {
+  if (key.length !== 32) {
+    throw new Error('BLAKE3 keyed_hash requires a 32-byte key');
+  }
+  return hashCore(input, keyToWords(key), KEYED_HASH, 32);
+}
+
+// Keyed hashing with extendable output.
+function keyedHashXOF(key, input, outLen) {
+  if (key.length !== 32) {
+    throw new Error('BLAKE3 keyed_hash requires a 32-byte key');
+  }
+  return hashCore(input, keyToWords(key), KEYED_HASH, outLen | 0);
+}
+
+// Key derivation. `context` is an application-specific string (or bytes);
+// `keyMaterial` is the input keying material. Two passes: derive a 32-byte
+// context key from the context, then hash the key material under it.
+const _utf8Encoder = new TextEncoder();
+function deriveContextKey(context) {
+  const ctxBytes = typeof context === 'string' ? _utf8Encoder.encode(context) : context;
+  return keyToWords(hashCore(ctxBytes, IV, DERIVE_KEY_CONTEXT, 32));
+}
+
+function deriveKey(context, keyMaterial) {
+  return hashCore(keyMaterial, deriveContextKey(context), DERIVE_KEY_MATERIAL, 32);
+}
+
+// Key derivation with extendable output.
+function deriveKeyXOF(context, keyMaterial, outLen) {
+  return hashCore(keyMaterial, deriveContextKey(context), DERIVE_KEY_MATERIAL, outLen | 0);
 }
 
 function wordsToBytes(words) {
@@ -555,8 +634,22 @@ function toHex(bytes) {
 }
 
 // ============================================================================
-// TEST & BENCHMARK
+// EXPORTS - importable as a library: `const { hash, toHex } = require('./blake3-ultra.js')`
 // ============================================================================
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    hash, hashXOF,
+    keyedHash, keyedHashXOF,
+    deriveKey, deriveKeyXOF,
+    toHex,
+  };
+}
+
+// ============================================================================
+// TEST & BENCHMARK - runs only when executed directly (`node blake3-ultra.js`),
+// not when the module is require()'d / imported.
+// ============================================================================
+if (typeof require !== 'undefined' && require.main === module) {
 
 console.log('BLAKE3 ULTRA - Fully Unrolled Node.js Benchmark');
 console.log('='.repeat(60));
@@ -642,3 +735,5 @@ for (const [size, label, iterations] of sizes) {
 
 console.log();
 console.log('Note: Browser (Chrome) typically performs 20-50% better than Node.js');
+
+} // end: if (require.main === module)

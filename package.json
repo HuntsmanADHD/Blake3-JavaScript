@@ -1,0 +1,15 @@
+{
+  "name": "blake3-ultra",
+  "version": "1.0.0",
+  "description": "High-performance pure-JavaScript BLAKE3 (256-bit, one-shot) optimized for the browser",
+  "main": "blake3-ultra.js",
+  "license": "MIT",
+  "scripts": {
+    "test": "node conformance.js",
+    "bench": "node blake3-ultra.js",
+    "bench:compare": "node bench.js"
+  },
+  "devDependencies": {
+    "@noble/hashes": "^1.4.0"
+  }
+}
