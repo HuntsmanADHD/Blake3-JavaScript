@@ -9,6 +9,7 @@
     "test:simd": "node blake3-simd.js",
     "bench": "node blake3-ultra.js",
     "bench:simd": "node blake3-simd.js",
+    "bench:simd8": "node simd8/blake3-simd8.js",
     "bench:compare": "node bench.js"
   },
   "devDependencies": {

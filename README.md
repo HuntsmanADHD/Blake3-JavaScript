@@ -6,7 +6,7 @@ A high performance pure JavaScript implementation of the BLAKE3 cryptographic ha
   - .9~1.0 GiB/s on modern browsers 100% pure JavaScript no WebAssembly, no SIMD, no Web Workers
   - ~8x faster than @noble/hashes BLAKE3 in pure JS
   - Fastest scalar pure JS entry in the BLAKE3 bounty field, see COMPARISON.md
-  - Optional WASM SIMD build reaches ~1.9 GiB/s, fastest JS+WASM entry in the field, see below
+  - Optional WASM SIMD builds reach ~1.9 GiB/s (4 wide) and ~2.0 GiB/s (8 wide), fastest single threaded entry in the field, see below
   - Tested on Intel Core i7-14700K
 
   ## Features
@@ -31,7 +31,7 @@ A high performance pure JavaScript implementation of the BLAKE3 cryptographic ha
   ```
 
   Importing the module does not run the benchmark. Run it directly for the
-  Node benchmark, or open blake3-ultra-v2.html in a browser.
+  Node benchmark
 
   ## Optional WASM SIMD build
 
@@ -52,6 +52,22 @@ A high performance pure JavaScript implementation of the BLAKE3 cryptographic ha
   toHex(hash(data));
   ```
 
+  ## 8 wide build (fastest single threaded)
+
+  simd8/blake3-simd8.js takes the same approach one step further, a compress8x that
+  runs two interleaved 128 bit v128 streams (8 chunks per call) for more instruction
+  level parallelism. Still 128 bit SIMD, still one thread, still one file.
+
+  - ~2.0 GiB/s at 256 KiB and up, fastest single threaded entry in the bounty field
+  - Sustains ~1.95 GiB/s at 100 MiB to 1 GiB (memory bandwidth bound)
+  - Passes all 35 official hash mode vectors, cross checked vs scalar to 100 MB
+  - The 8 wide gain over 4 wide is only ~6 percent, the kernel is throughput bound,
+    so ~2.0 GiB/s is the single threaded ceiling. 3+ GiB/s would need worker threads.
+
+  ```
+  node simd8/blake3-simd8.js   # self test + benchmark up to 1 GiB
+  ```
+
   See COMPARISON.md for the full on-machine table against the bounty entries.
 
   ## Testing
@@ -60,4 +76,5 @@ A high performance pure JavaScript implementation of the BLAKE3 cryptographic ha
   - `npm run test:simd` verifies the WASM SIMD build against the 35 hash mode vectors
   - `npm run bench` runs the Node throughput benchmark
   - `npm run bench:simd` self-tests and benchmarks the WASM SIMD build
+  - `npm run bench:simd8` self-tests and benchmarks the 8 wide build up to 1 GiB
   - `npm run bench:compare` runs a head to head against @noble/hashes and native SHA
